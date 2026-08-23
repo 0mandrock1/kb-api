@@ -4,8 +4,10 @@ from typing import Optional
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from fastmcp import FastMCP
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -20,15 +22,32 @@ DB_DSN = (
 
 pool: dict = {}
 
+mcp = FastMCP("kb-api")
+mcp_app = mcp.http_app(path="/")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pool["conn"] = await psycopg.AsyncConnection.connect(DB_DSN, row_factory=dict_row)
-    yield
+    async with mcp_app.lifespan(app):
+        yield
     await pool["conn"].close()
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def mcp_bearer_auth(request: Request, call_next):
+    if request.url.path.startswith("/mcp"):
+        try:
+            check_auth(request.headers.get("authorization"))
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
+
+
+app.mount("/mcp", mcp_app)
 
 
 def check_auth(authorization: Optional[str]):
@@ -51,20 +70,13 @@ async def healthz():
     return {"status": "ok"}
 
 
-@app.get("/v1/search")
-async def search(
-    q: str = Query(..., min_length=1),
-    ns: Optional[str] = Query(None),
-    visibility: Optional[str] = Query(None),
-    category: Optional[str] = Query(None),
-    limit: int = Query(10, ge=1, le=100),
-    authorization: Optional[str] = Header(None),
-):
-    check_auth(authorization)
-
-    namespaces = parse_csv(ns, "prod")
-    visibilities = parse_csv(visibility, "public")
-
+async def _search(
+    q: str,
+    namespaces: list[str],
+    visibilities: list[str],
+    category: Optional[str],
+    limit: int,
+) -> dict:
     conn = pool["conn"]
     sql = """
         SELECT id, slug, title, heading_path, leaf_heading, category, body,
@@ -97,9 +109,7 @@ async def search(
     return {"results": rows, "count": len(rows)}
 
 
-@app.get("/v1/chunk/{chunk_id}")
-async def get_chunk(chunk_id: int, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+async def _get_chunk(chunk_id: int) -> dict:
     conn = pool["conn"]
     async with conn.cursor() as cur:
         await cur.execute(
@@ -131,15 +141,7 @@ async def get_chunk(chunk_id: int, authorization: Optional[str] = Header(None)):
     return {"chunk": chunk, "neighbors": neighbors}
 
 
-@app.get("/v1/article/{slug}")
-async def get_article(
-    slug: str,
-    ns: Optional[str] = Query(None),
-    authorization: Optional[str] = Header(None),
-):
-    check_auth(authorization)
-    namespaces = parse_csv(ns, "prod")
-
+async def _get_article(slug: str, namespaces: list[str]) -> dict:
     conn = pool["conn"]
     async with conn.cursor() as cur:
         await cur.execute(
@@ -159,9 +161,7 @@ async def get_article(
     return {"slug": slug, "chunks": rows}
 
 
-@app.get("/v1/stats")
-async def stats(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+async def _stats() -> dict:
     conn = pool["conn"]
     async with conn.cursor() as cur:
         await cur.execute(
@@ -176,3 +176,80 @@ async def stats(authorization: Optional[str] = Header(None)):
         await cur.execute("SELECT max(indexed_at) AS max_indexed_at FROM rag.chunks")
         max_indexed = await cur.fetchone()
     return {"breakdown": breakdown, "max_indexed_at": max_indexed["max_indexed_at"]}
+
+
+@app.get("/v1/search")
+async def search(
+    q: str = Query(..., min_length=1),
+    ns: Optional[str] = Query(None),
+    visibility: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
+):
+    check_auth(authorization)
+    return await _search(q, parse_csv(ns, "prod"), parse_csv(visibility, "public"), category, limit)
+
+
+@app.get("/v1/chunk/{chunk_id}")
+async def get_chunk(chunk_id: int, authorization: Optional[str] = Header(None)):
+    check_auth(authorization)
+    return await _get_chunk(chunk_id)
+
+
+@app.get("/v1/article/{slug}")
+async def get_article(
+    slug: str,
+    ns: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    check_auth(authorization)
+    return await _get_article(slug, parse_csv(ns, "prod"))
+
+
+@app.get("/v1/stats")
+async def stats(authorization: Optional[str] = Header(None)):
+    check_auth(authorization)
+    return await _stats()
+
+
+@mcp.tool(
+    description=(
+        "Search the knowledge base full-text index. By default returns only "
+        "PUBLIC content from the PROD namespace (namespace='prod', "
+        "visibility='public') — pass explicit namespace/visibility to widen "
+        "the scope. Returns matching chunks ranked by relevance."
+    )
+)
+async def kb_search(
+    query: str,
+    namespace: str = "prod",
+    visibility: str = "public",
+    category: Optional[str] = None,
+    limit: int = 10,
+) -> dict:
+    return await _search(query, [namespace], [visibility], category, limit)
+
+
+@mcp.tool(
+    description=(
+        "Fetch a full article (all its chunks, in order) by slug. By default "
+        "looks it up in the PROD namespace (namespace='prod'); this tool does "
+        "not filter by visibility, so it can return non-public chunks if the "
+        "slug belongs to one — check the 'visibility' field on returned chunks."
+    )
+)
+async def kb_get_article(slug: str, namespace: str = "prod") -> dict:
+    return await _get_article(slug, [namespace])
+
+
+@mcp.tool(
+    description=(
+        "Return knowledge base statistics: a breakdown of chunk counts by "
+        "namespace/visibility/category, and the most recent indexed_at "
+        "timestamp. Covers all namespaces and visibilities, not just "
+        "public prod content."
+    )
+)
+async def kb_stats() -> dict:
+    return await _stats()
