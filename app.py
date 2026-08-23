@@ -1,3 +1,4 @@
+import hmac
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -12,6 +13,11 @@ from fastmcp import FastMCP
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 KB_API_TOKEN = os.environ["KB_API_TOKEN"]
+# Service token for @mndrcknowledgebot: server-side hardcoded scope, request
+# ns/visibility params are IGNORED for this token (see check_auth / role="bot").
+KB_BOT_TOKEN = os.environ.get("KB_BOT_TOKEN")
+BOT_NAMESPACES = ["prod", "lib"]
+BOT_VISIBILITIES = ["public"]
 DB_DSN = (
     f"host={os.environ.get('KB_DB_HOST', '127.0.0.1')} "
     f"port={os.environ.get('KB_DB_PORT', '5433')} "
@@ -41,7 +47,8 @@ app = FastAPI(lifespan=lifespan)
 async def mcp_bearer_auth(request: Request, call_next):
     if request.url.path.startswith("/mcp"):
         try:
-            check_auth(request.headers.get("authorization"))
+            if check_auth(request.headers.get("authorization")) != "admin":
+                raise HTTPException(status_code=403, detail="forbidden")
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)
@@ -50,12 +57,17 @@ async def mcp_bearer_auth(request: Request, call_next):
 app.mount("/mcp", mcp_app)
 
 
-def check_auth(authorization: Optional[str]):
+def check_auth(authorization: Optional[str]) -> str:
+    """Return the caller role: 'admin' (full control over ns/visibility) or
+    'bot' (server-side hardcoded scope, request params ignored)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization[len("Bearer "):]
-    if token != KB_API_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
+    if hmac.compare_digest(token, KB_API_TOKEN):
+        return "admin"
+    if KB_BOT_TOKEN and hmac.compare_digest(token, KB_BOT_TOKEN):
+        return "bot"
+    raise HTTPException(status_code=401, detail="invalid token")
 
 
 def parse_csv(value: Optional[str], default: str) -> list[str]:
@@ -80,6 +92,7 @@ async def _search(
     conn = pool["conn"]
     sql = """
         SELECT id, slug, title, heading_path, leaf_heading, category, body,
+               namespace, visibility,
                (ts_rank_cd(fts, websearch_to_tsquery('simple', %(q)s))
                 + COALESCE(similarity(title, %(q)s), 0)) AS score
         FROM rag.chunks
@@ -187,14 +200,26 @@ async def search(
     limit: int = Query(10, ge=1, le=100),
     authorization: Optional[str] = Header(None),
 ):
-    check_auth(authorization)
+    role = check_auth(authorization)
+    if role == "bot":
+        # Hardcoded scope; request ns/visibility are intentionally ignored.
+        return await _search(q, BOT_NAMESPACES, BOT_VISIBILITIES, category, limit)
     return await _search(q, parse_csv(ns, "prod"), parse_csv(visibility, "public"), category, limit)
 
 
 @app.get("/v1/chunk/{chunk_id}")
 async def get_chunk(chunk_id: int, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
-    return await _get_chunk(chunk_id)
+    role = check_auth(authorization)
+    result = await _get_chunk(chunk_id)
+    if role == "bot":
+        chunk = result["chunk"]
+        if chunk["namespace"] not in BOT_NAMESPACES or chunk["visibility"] not in BOT_VISIBILITIES:
+            raise HTTPException(status_code=404, detail="chunk not found")
+        result["neighbors"] = [
+            n for n in result["neighbors"]
+            if n["namespace"] in BOT_NAMESPACES and n["visibility"] in BOT_VISIBILITIES
+        ]
+    return result
 
 
 @app.get("/v1/article/{slug}")
@@ -203,14 +228,26 @@ async def get_article(
     ns: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
-    check_auth(authorization)
+    role = check_auth(authorization)
+    if role == "bot":
+        result = await _get_article(slug, BOT_NAMESPACES)
+        result["chunks"] = [c for c in result["chunks"] if c["visibility"] in BOT_VISIBILITIES]
+        if not result["chunks"]:
+            raise HTTPException(status_code=404, detail="article not found")
+        return result
     return await _get_article(slug, parse_csv(ns, "prod"))
 
 
 @app.get("/v1/stats")
 async def stats(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
-    return await _stats()
+    role = check_auth(authorization)
+    result = await _stats()
+    if role == "bot":
+        result["breakdown"] = [
+            b for b in result["breakdown"]
+            if b["namespace"] in BOT_NAMESPACES and b["visibility"] in BOT_VISIBILITIES
+        ]
+    return result
 
 
 @mcp.tool(
