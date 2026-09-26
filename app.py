@@ -40,6 +40,44 @@ async def lifespan(app: FastAPI):
     await pool["conn"].close()
 
 
+async def get_conn() -> psycopg.AsyncConnection:
+    """Return a live connection, reconnecting if the pooled one is dead."""
+    conn = pool["conn"]
+    alive = not conn.closed
+    if alive:
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+        except psycopg.OperationalError:
+            alive = False
+    if not alive:
+        if not conn.closed:
+            await conn.close()
+        conn = await psycopg.AsyncConnection.connect(DB_DSN, row_factory=dict_row)
+        pool["conn"] = conn
+    return conn
+
+
+async def with_db_retry(fn):
+    """Run fn(conn) against the pooled connection, reconnecting and retrying
+    once on a dropped connection before surfacing a 503."""
+    conn = await get_conn()
+    try:
+        return await fn(conn)
+    except psycopg.OperationalError:
+        if not conn.closed:
+            await conn.close()
+        try:
+            conn = await psycopg.AsyncConnection.connect(DB_DSN, row_factory=dict_row)
+            pool["conn"] = conn
+        except psycopg.OperationalError:
+            raise HTTPException(status_code=503, detail="db unavailable")
+        try:
+            return await fn(conn)
+        except psycopg.OperationalError:
+            raise HTTPException(status_code=503, detail="db unavailable")
+
+
 app = FastAPI(lifespan=lifespan)
 
 
@@ -89,7 +127,6 @@ async def _search(
     category: Optional[str],
     limit: int,
 ) -> dict:
-    conn = pool["conn"]
     sql = """
         SELECT id, slug, title, heading_path, leaf_heading, category, body,
                namespace, visibility,
@@ -107,88 +144,119 @@ async def _search(
         ORDER BY score DESC
         LIMIT %(limit)s
     """
-    async with conn.cursor() as cur:
-        await cur.execute(
-            sql,
-            {
-                "q": q,
-                "namespaces": namespaces,
-                "visibilities": visibilities,
-                "category": category,
-                "limit": limit,
-            },
-        )
-        rows = await cur.fetchall()
+
+    async def run(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                sql,
+                {
+                    "q": q,
+                    "namespaces": namespaces,
+                    "visibilities": visibilities,
+                    "category": category,
+                    "limit": limit,
+                },
+            )
+            return await cur.fetchall()
+
+    rows = await with_db_retry(run)
     return {"results": rows, "count": len(rows)}
 
 
 async def _get_chunk(chunk_id: int) -> dict:
-    conn = pool["conn"]
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
-                   body, char_len, indexed_at, leaf_heading, is_boilerplate,
-                   namespace, visibility
-            FROM rag.chunks WHERE id = %s
-            """,
-            (chunk_id,),
-        )
-        chunk = await cur.fetchone()
-        if not chunk:
-            raise HTTPException(status_code=404, detail="chunk not found")
+    async def run(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
+                       body, char_len, indexed_at, leaf_heading, is_boilerplate,
+                       namespace, visibility
+                FROM rag.chunks WHERE id = %s
+                """,
+                (chunk_id,),
+            )
+            chunk = await cur.fetchone()
+            if not chunk:
+                raise HTTPException(status_code=404, detail="chunk not found")
 
-        await cur.execute(
-            """
-            SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
-                   body, char_len, indexed_at, leaf_heading, is_boilerplate,
-                   namespace, visibility
-            FROM rag.chunks
-            WHERE slug = %s AND chunk_idx IN (%s, %s)
-            ORDER BY chunk_idx
-            """,
-            (chunk["slug"], chunk["chunk_idx"] - 1, chunk["chunk_idx"] + 1),
-        )
-        neighbors = await cur.fetchall()
+            await cur.execute(
+                """
+                SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
+                       body, char_len, indexed_at, leaf_heading, is_boilerplate,
+                       namespace, visibility
+                FROM rag.chunks
+                WHERE slug = %s AND chunk_idx IN (%s, %s)
+                ORDER BY chunk_idx
+                """,
+                (chunk["slug"], chunk["chunk_idx"] - 1, chunk["chunk_idx"] + 1),
+            )
+            neighbors = await cur.fetchall()
+        return {"chunk": chunk, "neighbors": neighbors}
 
-    return {"chunk": chunk, "neighbors": neighbors}
+    return await with_db_retry(run)
 
 
 async def _get_article(slug: str, namespaces: list[str]) -> dict:
-    conn = pool["conn"]
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
-                   body, char_len, indexed_at, leaf_heading, is_boilerplate,
-                   namespace, visibility
-            FROM rag.chunks
-            WHERE slug = %s AND namespace = ANY(%s)
-            ORDER BY chunk_idx
-            """,
-            (slug, namespaces),
-        )
-        rows = await cur.fetchall()
+    async def run(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, article_id, slug, category, title, heading_path, chunk_idx,
+                       body, char_len, indexed_at, leaf_heading, is_boilerplate,
+                       namespace, visibility
+                FROM rag.chunks
+                WHERE slug = %s AND namespace = ANY(%s)
+                ORDER BY chunk_idx
+                """,
+                (slug, namespaces),
+            )
+            return await cur.fetchall()
+
+    rows = await with_db_retry(run)
     if not rows:
         raise HTTPException(status_code=404, detail="article not found")
     return {"slug": slug, "chunks": rows}
 
 
 async def _stats() -> dict:
-    conn = pool["conn"]
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            SELECT namespace, visibility, category, count(*) AS n
-            FROM rag.chunks
-            GROUP BY namespace, visibility, category
-            ORDER BY namespace, visibility, category
-            """
-        )
-        breakdown = await cur.fetchall()
-        await cur.execute("SELECT max(indexed_at) AS max_indexed_at FROM rag.chunks")
-        max_indexed = await cur.fetchone()
-    return {"breakdown": breakdown, "max_indexed_at": max_indexed["max_indexed_at"]}
+    async def run(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT namespace, visibility, category, count(*) AS n
+                FROM rag.chunks
+                GROUP BY namespace, visibility, category
+                ORDER BY namespace, visibility, category
+                """
+            )
+            breakdown = await cur.fetchall()
+            await cur.execute("SELECT max(indexed_at) AS max_indexed_at FROM rag.chunks")
+            max_indexed = await cur.fetchone()
+        return {"breakdown": breakdown, "max_indexed_at": max_indexed["max_indexed_at"]}
+
+    return await with_db_retry(run)
+
+
+async def _random(namespaces: list[str], visibilities: list[str], limit: int) -> dict:
+    async def run(conn):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, slug, title, heading_path, leaf_heading, category, body,
+                       namespace, visibility
+                FROM rag.chunks
+                WHERE is_boilerplate = false
+                  AND namespace = ANY(%(namespaces)s)
+                  AND visibility = ANY(%(visibilities)s)
+                ORDER BY random()
+                LIMIT %(limit)s
+                """,
+                {"namespaces": namespaces, "visibilities": visibilities, "limit": limit},
+            )
+            return await cur.fetchall()
+
+    rows = await with_db_retry(run)
+    return {"results": rows, "count": len(rows)}
 
 
 @app.get("/v1/search")
@@ -236,6 +304,20 @@ async def get_article(
             raise HTTPException(status_code=404, detail="article not found")
         return result
     return await _get_article(slug, parse_csv(ns, "prod"))
+
+
+@app.get("/v1/random")
+async def random_chunks(
+    limit: int = Query(2, ge=1, le=50),
+    ns: Optional[str] = Query(None),
+    visibility: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    role = check_auth(authorization)
+    if role == "bot":
+        # Hardcoded scope; request ns/visibility are intentionally ignored.
+        return await _random(BOT_NAMESPACES, BOT_VISIBILITIES, limit)
+    return await _random(parse_csv(ns, "prod"), parse_csv(visibility, "public"), limit)
 
 
 @app.get("/v1/stats")
@@ -290,3 +372,15 @@ async def kb_get_article(slug: str, namespace: str = "prod") -> dict:
 )
 async def kb_stats() -> dict:
     return await _stats()
+
+
+@mcp.tool(
+    description=(
+        "Return N random chunks from the knowledge base. By default returns "
+        "only PUBLIC content from the PROD namespace (namespace='prod', "
+        "visibility='public') — pass explicit namespace/visibility to widen "
+        "the scope."
+    )
+)
+async def kb_random(namespace: str = "prod", visibility: str = "public", limit: int = 2) -> dict:
+    return await _random([namespace], [visibility], limit)
